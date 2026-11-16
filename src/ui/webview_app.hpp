@@ -161,9 +161,7 @@ private:
                                 }
 
                                 webview_controller_->get_CoreWebView2(&webview_);
-                                RECT bounds;
-                                GetClientRect(hwnd_, &bounds);
-                                webview_controller_->put_Bounds(bounds);
+                                resize_webview();
 
                                 // Settings
                                 ICoreWebView2Settings* settings = nullptr;
@@ -286,9 +284,7 @@ private:
 
     void resize_webview() {
         if (webview_controller_) {
-            RECT bounds;
-            GetClientRect(hwnd_, &bounds);
-            webview_controller_->put_Bounds(bounds);
+            webview_controller_->put_Bounds(webview_bounds());
         }
     }
 #else
@@ -418,32 +414,56 @@ private:
         if (on_visibility_change_) on_visibility_change_(v);
     }
 
-    // ---- Hit test for resize edges (title bar drag handled by WebView2 NonClientRegion) ----
-    LRESULT handle_nchittest(HWND hwnd, LPARAM lparam) {
-        POINT pt = { GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) };
-        ScreenToClient(hwnd, &pt);
-        RECT rc;
-        GetClientRect(hwnd, &rc);
+    static constexpr int resize_border = 6;
 
-        // Don't handle resize edges when maximized
+    static int scale_for_window(HWND hwnd, int size) {
+        const UINT dpi = GetDpiForWindow(hwnd);
+        return MulDiv(size, dpi ? dpi : USER_DEFAULT_SCREEN_DPI, USER_DEFAULT_SCREEN_DPI);
+    }
+
+    RECT webview_bounds() const {
+        RECT bounds{};
+        GetClientRect(hwnd_, &bounds);
+        if (!IsZoomed(hwnd_) && !IsIconic(hwnd_)) {
+            // Leave resize hit targets on the host instead of under the WebView2 child.
+            const int border = scale_for_window(hwnd_, resize_border);
+            if (bounds.right > 2 * border && bounds.bottom > 2 * border) {
+                InflateRect(&bounds, -border, -border);
+            }
+        }
+        return bounds;
+    }
+
+    // Title bar drag is handled by WebView2 NonClientRegion.
+    static LRESULT handle_nchittest(HWND hwnd, LPARAM lparam) {
         if (IsZoomed(hwnd)) return HTCLIENT;
 
-        int border = 6;
-        UINT dpi = GetDpiForWindow(hwnd);
-        if (dpi > 0) border = MulDiv(6, dpi, 96);
-        bool left   = pt.x < border;
-        bool right  = pt.x >= rc.right - border;
-        bool top    = pt.y < border;
-        bool bottom = pt.y >= rc.bottom - border;
+        RECT rect;
+        if (!GetWindowRect(hwnd, &rect)) return HTCLIENT;
+        const LONG x = GET_X_LPARAM(lparam);
+        const LONG y = GET_Y_LPARAM(lparam);
+        const int border = scale_for_window(hwnd, resize_border);
+        const int bottom_corner = scale_for_window(hwnd, 16);
+        const bool left = x < rect.left + border;
+        const bool right = x >= rect.right - border;
+        const bool top = y < rect.top + border;
+        const bool bottom = y >= rect.bottom - border;
 
-        if (top && left)     return HTTOPLEFT;
-        if (top && right)    return HTTOPRIGHT;
-        if (bottom && left)  return HTBOTTOMLEFT;
-        if (bottom && right) return HTBOTTOMRIGHT;
-        if (left)            return HTLEFT;
-        if (right)           return HTRIGHT;
-        if (top)             return HTTOP;
-        if (bottom)          return HTBOTTOM;
+        // Extend the bottom corners along the bottom and side borders.
+        if ((bottom && x < rect.left + bottom_corner) ||
+            (left && y >= rect.bottom - bottom_corner)) {
+            return HTBOTTOMLEFT;
+        }
+        if ((bottom && x >= rect.right - bottom_corner) ||
+            (right && y >= rect.bottom - bottom_corner)) {
+            return HTBOTTOMRIGHT;
+        }
+        if (top && left) return HTTOPLEFT;
+        if (top && right) return HTTOPRIGHT;
+        if (left) return HTLEFT;
+        if (right) return HTRIGHT;
+        if (top) return HTTOP;
+        if (bottom) return HTBOTTOM;
 
         return HTCLIENT;  // WebView2 handles the rest (drag regions via CSS)
     }
@@ -587,6 +607,13 @@ private:
         }
         // Suppress background erase to prevent white flash.
         if (msg == WM_ERASEBKGND) return 1;
+        if (msg == WM_PAINT) {
+            PAINTSTRUCT paint;
+            HDC dc = BeginPaint(hwnd, &paint);
+            FillRect(dc, &paint.rcPaint, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+            EndPaint(hwnd, &paint);
+            return 0;
+        }
 
         auto* app = reinterpret_cast<webview_app*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
         if (!app) return DefWindowProc(hwnd, msg, wparam, lparam);
@@ -608,7 +635,7 @@ private:
 
         switch (msg) {
             case WM_NCHITTEST: {
-                LRESULT hit = app->handle_nchittest(hwnd, lparam);
+                LRESULT hit = handle_nchittest(hwnd, lparam);
                 // Fall through to DefWindowProc so WebView2 gets drag regions.
                 if (hit != HTCLIENT) return hit;
                 break;
@@ -731,7 +758,7 @@ public:
 
         hwnd_ = CreateWindowExW(
             0, L"ClewWebViewClass", title_.c_str(),
-            WS_OVERLAPPEDWINDOW,
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             x, y, width_, height_,
             nullptr, nullptr, hinstance, this
         );
